@@ -19,6 +19,8 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QObject,
     QSettings,
+    QRunnable,
+    QThreadPool,
 )
 from PyQt5.QtGui import QDesktopServices, QFont
 from PyQt5.QtWidgets import (
@@ -37,6 +39,7 @@ from PyQt5.QtWidgets import (
     QInputDialog,
     QMessageBox,
     QHBoxLayout,
+    QProgressDialog,
 )
 
 from watchdog.observers import Observer
@@ -66,6 +69,88 @@ class DirectoryWatcher(QObject, FileSystemEventHandler):
         self.changed.emit()
 
 
+class FileOpSignals(QObject):
+    """Signals for file operation workers."""
+
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(list)
+
+
+class FileOpWorker(QRunnable):
+    """Perform copy/move/delete operations in a separate thread."""
+
+    def __init__(self, op: str, paths: list[str], dest: str | None = None):
+        super().__init__()
+        self.op = op
+        self.paths = paths
+        self.dest = dest
+        self.signals = FileOpSignals()
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):  # type: ignore[override]
+        errors: list[str] = []
+        total = len(self.paths)
+        for i, path in enumerate(self.paths, 1):
+            if self._cancel:
+                break
+            try:
+                if self.op == "copy":
+                    base = os.path.basename(path)
+                    target = os.path.join(self.dest, base)  # type: ignore[arg-type]
+                    if os.path.isdir(path):
+                        shutil.copytree(path, target)
+                    else:
+                        shutil.copy2(path, target)
+                elif self.op == "move":
+                    base = os.path.basename(path)
+                    target = os.path.join(self.dest, base)  # type: ignore[arg-type]
+                    shutil.move(path, target)
+                elif self.op == "delete":
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+            except OSError as e:
+                errors.append(f"{path}: {e}")
+            self.signals.progress.emit(i, total, path)
+        self.signals.finished.emit(errors)
+
+
+def run_file_operation(parent: QWidget, op: str, paths: list[str], dest: str | None = None, on_done=None):
+    """Run a file operation with progress dialog and threading."""
+
+    progress = QProgressDialog(f"{op.title()}ing files...", "Cancel", 0, len(paths), parent)
+    progress.setWindowModality(Qt.WindowModal)
+    progress.setMinimumDuration(0)
+
+    worker = FileOpWorker(op, paths, dest)
+    worker.signals.progress.connect(lambda i, t, p: (progress.setValue(i), progress.setLabelText(p)))
+
+    def finish(errors: list[str]):
+        progress.close()
+        if errors:
+            QMessageBox.warning(parent, "Errors", "\n".join(errors))
+        if on_done:
+            on_done(errors)
+
+    worker.signals.finished.connect(finish)
+    progress.canceled.connect(worker.cancel)
+    QThreadPool.globalInstance().start(worker)
+
+
+class EditProxyModel(QSortFilterProxyModel):
+    """Proxy model that only allows editing of the first column."""
+
+    def flags(self, index):  # type: ignore[override]
+        flags = super().flags(index)
+        if index.column() != 0:
+            flags &= ~Qt.ItemIsEditable
+        return flags
+
+
 class FileTab(QWidget):
     """A single tab containing a file system view and search box."""
 
@@ -85,7 +170,7 @@ class FileTab(QWidget):
         self.model.setRootPath(self.path)
         self.model.setReadOnly(False)
 
-        self.proxy = QSortFilterProxyModel(self)
+        self.proxy = EditProxyModel(self)
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.proxy.setFilterKeyColumn(0)
@@ -99,6 +184,14 @@ class FileTab(QWidget):
         self.view.setDragDropMode(QAbstractItemView.DragDrop)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self.open_menu)
+        self.view.setEditTriggers(
+            QAbstractItemView.EditKeyPressed | QAbstractItemView.SelectedClicked
+        )
+
+        f2 = QAction(self)
+        f2.setShortcut("F2")
+        f2.triggered.connect(lambda: self.view.edit(self.view.currentIndex()))
+        self.addAction(f2)
 
         layout.addWidget(self.view)
 
@@ -172,15 +265,11 @@ class FileTab(QWidget):
 
     # context actions
     def rename_item(self, path):
-        base = os.path.basename(path)
-        directory = os.path.dirname(path)
-        new_name, ok = QInputDialog.getText(self, "Rename", "New name:", text=base)
-        if ok and new_name:
-            new_path = os.path.join(directory, new_name)
-            try:
-                os.rename(path, new_path)
-            except OSError as e:
-                QMessageBox.warning(self, "Error", str(e))
+        idx = self.model.index(path)
+        if idx.isValid():
+            proxy_idx = self.proxy.mapFromSource(idx)
+            self.view.setCurrentIndex(proxy_idx)
+            self.view.edit(proxy_idx)
 
     def delete_items(self, paths):
         reply = QMessageBox.question(
@@ -190,14 +279,7 @@ class FileTab(QWidget):
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            for path in paths:
-                try:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                except OSError as e:
-                    QMessageBox.warning(self, "Error", str(e))
+            run_file_operation(self, "delete", paths)
 
     def new_folder(self):
         name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
@@ -212,22 +294,12 @@ class FileTab(QWidget):
         dest = QFileDialog.getExistingDirectory(self, "Select destination")
         if not dest:
             return
-        op, ok = QInputDialog.getItem(self, "Operation", "Copy or Move?", ["Copy", "Move"], 0, False)
+        op, ok = QInputDialog.getItem(
+            self, "Operation", "Copy or Move?", ["Copy", "Move"], 0, False
+        )
         if not ok:
             return
-        for path in paths:
-            try:
-                base = os.path.basename(path)
-                target = os.path.join(dest, base)
-                if op == "Copy":
-                    if os.path.isdir(path):
-                        shutil.copytree(path, target)
-                    else:
-                        shutil.copy2(path, target)
-                else:
-                    shutil.move(path, target)
-            except OSError as e:
-                QMessageBox.warning(self, "Error", str(e))
+        run_file_operation(self, op.lower(), paths, dest)
 
     def show_properties(self, path):
         info = Path(path)
@@ -353,22 +425,17 @@ class MainWindow(QMainWindow):
     def paste(self):
         tab = self.current_tab()
         dest = tab.path
-        for path in self.clipboard:
-            try:
-                base = os.path.basename(path)
-                target = os.path.join(dest, base)
-                if self.cut_mode:
-                    shutil.move(path, target)
-                else:
-                    if os.path.isdir(path):
-                        shutil.copytree(path, target)
-                    else:
-                        shutil.copy2(path, target)
-            except OSError as e:
-                QMessageBox.warning(self, "Error", str(e))
-        if self.cut_mode:
-            self.clipboard = []
-            self.cut_mode = False
+        if not self.clipboard:
+            return
+        paths = list(self.clipboard)
+        op = "move" if self.cut_mode else "copy"
+
+        def done(_errors):
+            if self.cut_mode:
+                self.clipboard = []
+                self.cut_mode = False
+
+        run_file_operation(self, op, paths, dest, done)
 
     def check_drives(self):
         volumes = {
