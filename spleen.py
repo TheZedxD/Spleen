@@ -10,6 +10,7 @@ import shutil
 import zipfile
 import fnmatch
 from pathlib import Path
+import subprocess
 
 from PyQt5.QtCore import (
     Qt,
@@ -22,6 +23,7 @@ from PyQt5.QtCore import (
     QSettings,
     QRunnable,
     QThreadPool,
+    QItemSelectionModel,
 )
 from PyQt5.QtGui import QDesktopServices, QFont
 from PyQt5.QtWidgets import (
@@ -187,6 +189,60 @@ class EditProxyModel(QSortFilterProxyModel):
         return flags
 
 
+class FileTreeView(QTreeView):
+    """Tree view with custom drag-and-drop semantics."""
+
+    def __init__(self, tab: "FileTab"):
+        super().__init__(tab)
+        self.tab = tab
+
+    def dragEnterEvent(self, event):  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):  # type: ignore[override]
+        if not event.mimeData().hasUrls():
+            return super().dropEvent(event)
+
+        paths = [u.toLocalFile() for u in event.mimeData().urls()]
+
+        idx = self.indexAt(event.pos())
+        if idx.isValid():
+            src_idx = self.tab.proxy.mapToSource(idx)
+            dest = self.tab.model.filePath(src_idx)
+            if not os.path.isdir(dest):
+                dest = os.path.dirname(dest)
+        else:
+            dest = self.tab.path
+
+        modifiers = event.keyboardModifiers()
+        action = "move" if modifiers & Qt.ShiftModifier else "copy"
+
+        if action == "move":
+            dest_dev = os.stat(dest).st_dev
+            same_dev = all(os.stat(p).st_dev == dest_dev for p in paths)
+            op = "move" if same_dev else "copy"
+        else:
+            op = "copy"
+
+        new_paths = [os.path.join(dest, os.path.basename(p)) for p in paths]
+
+        def select_new(_errors):
+            self.tab.refresh()
+            sel = self.tab.view.selectionModel()
+            sel.clearSelection()
+            for p in new_paths:
+                idx = self.tab.model.index(p)
+                if idx.isValid():
+                    proxy_idx = self.tab.proxy.mapFromSource(idx)
+                    sel.select(proxy_idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+
+        run_file_operation(self.tab, op, paths, dest, select_new)
+        event.acceptProposedAction()
+
+
 class FileTab(QWidget):
     """A single tab containing a file system view and search box."""
 
@@ -225,7 +281,7 @@ class FileTab(QWidget):
         self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.proxy.setFilterKeyColumn(0)
 
-        self.view = QTreeView()
+        self.view = FileTreeView(self)
         self.view.setModel(self.proxy)
         self.view.setRootIndex(self.proxy.mapFromSource(self.model.index(self.path)))
         self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -337,6 +393,7 @@ class FileTab(QWidget):
         menu = QMenu()
 
         open_act = menu.addAction("Open")
+        open_with_act = menu.addAction("Open With...")
         rename_act = menu.addAction("Rename")
         delete_act = menu.addAction("Delete")
         new_folder_act = menu.addAction("New Folder")
@@ -353,6 +410,8 @@ class FileTab(QWidget):
         if action == open_act:
             for path in paths:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        elif action == open_with_act and paths:
+            self.open_with(paths[0])
         elif action == rename_act and paths:
             self.rename_item(paths[0])
         elif action == delete_act and paths:
@@ -367,6 +426,14 @@ class FileTab(QWidget):
             self.extract_zip(paths[0])
 
     # context actions
+    def open_with(self, path):
+        cmd, ok = QInputDialog.getText(self, "Open With", "Command:", text="xdg-open")
+        if ok and cmd:
+            try:
+                subprocess.Popen([cmd, path])
+            except OSError as e:
+                QMessageBox.warning(self, "Error", str(e))
+
     def rename_item(self, path):
         idx = self.model.index(path)
         if idx.isValid():
