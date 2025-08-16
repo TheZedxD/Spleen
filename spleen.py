@@ -1,3 +1,9 @@
+"""Spleen file manager.
+
+Provides a lightweight tabbed interface with search, context menu file
+operations, drive monitoring, configurable defaults and a zoomable UI.
+"""
+
 import os
 import sys
 import shutil
@@ -5,13 +11,32 @@ import zipfile
 from pathlib import Path
 
 from PyQt5.QtCore import (
-    Qt, QUrl, QSortFilterProxyModel, QTimer, QStorageInfo, pyqtSignal, QObject
+    Qt,
+    QUrl,
+    QSortFilterProxyModel,
+    QTimer,
+    QStorageInfo,
+    pyqtSignal,
+    QObject,
+    QSettings,
 )
-from PyQt5.QtGui import QDesktopServices
+from PyQt5.QtGui import QDesktopServices, QFont
 from PyQt5.QtWidgets import (
-    QApplication, QTreeView, QFileSystemModel, QAbstractItemView, QMainWindow,
-    QTabWidget, QWidget, QVBoxLayout, QLineEdit, QMenu, QAction,
-    QFileDialog, QInputDialog, QMessageBox, QHBoxLayout
+    QApplication,
+    QTreeView,
+    QFileSystemModel,
+    QAbstractItemView,
+    QMainWindow,
+    QTabWidget,
+    QWidget,
+    QVBoxLayout,
+    QLineEdit,
+    QMenu,
+    QAction,
+    QFileDialog,
+    QInputDialog,
+    QMessageBox,
+    QHBoxLayout,
 )
 
 from watchdog.observers import Observer
@@ -84,11 +109,18 @@ class FileTab(QWidget):
         self.watcher.changed.connect(self.refresh)
         self.watcher.start()
 
+        # apply current font
+        self.set_font(self.font())
+
     def refresh(self):
         self.model.refresh(self.model.index(self.path))
 
     def cleanup(self):
         self.watcher.stop()
+
+    def set_font(self, font: QFont):
+        self.view.setFont(font)
+        self.search.setFont(font)
 
     # Context menu implementation
     def open_menu(self, position):
@@ -208,6 +240,19 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Spleen")
+        self.setMinimumSize(600, 400)
+
+        self.settings = QSettings("Spleen", "Spleen")
+        self.default_path = self.settings.value("default_path", str(Path.home()))
+        self.zoom_factor = float(self.settings.value("zoom", 1.0))
+        self.base_font_size = self.font().pointSizeF()
+
+        geometry = self.settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        else:
+            self.resize(800, 600)
+
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
@@ -215,6 +260,8 @@ class MainWindow(QMainWindow):
         self.cut_mode = False
 
         self.create_menus()
+        self.new_tab(self.default_path)
+        self.apply_zoom()
 
         self.drives = set()
         self.timer = QTimer()
@@ -240,13 +287,38 @@ class MainWindow(QMainWindow):
         paste_act.triggered.connect(self.paste)
         edit_menu.addActions([cut_act, copy_act, paste_act])
 
+        view_menu = self.menuBar().addMenu("View")
+        zoom_in_act = QAction("Zoom In", self)
+        zoom_in_act.setShortcut("Ctrl++")
+        zoom_in_act.triggered.connect(self.zoom_in)
+        zoom_out_act = QAction("Zoom Out", self)
+        zoom_out_act.setShortcut("Ctrl+-")
+        zoom_out_act.triggered.connect(self.zoom_out)
+        reset_zoom_act = QAction("Reset Zoom", self)
+        reset_zoom_act.setShortcut("Ctrl+0")
+        reset_zoom_act.triggered.connect(self.reset_zoom)
+        view_menu.addActions([zoom_in_act, zoom_out_act, reset_zoom_act])
+
+        settings_menu = self.menuBar().addMenu("Settings")
+        set_def_act = QAction("Set Default Path", self)
+        set_def_act.triggered.connect(self.set_default_path)
+        clr_def_act = QAction("Clear Default Path", self)
+        clr_def_act.triggered.connect(self.clear_default_path)
+        settings_menu.addActions([set_def_act, clr_def_act])
+
+        help_menu = self.menuBar().addMenu("Help")
+        about_act = QAction("About", self)
+        about_act.triggered.connect(self.show_about)
+        help_menu.addAction(about_act)
+
     # menu actions
     def new_tab(self, path=None):
         if path is None:
-            path = QFileDialog.getExistingDirectory(self, "Open Directory", os.path.expanduser("~"))
+            path = QFileDialog.getExistingDirectory(self, "Open Directory", self.default_path)
             if not path:
                 return
         tab = FileTab(path)
+        tab.set_font(self.font())
         index = self.tabs.addTab(tab, path)
         self.tabs.setCurrentIndex(index)
 
@@ -303,11 +375,54 @@ class MainWindow(QMainWindow):
         self.drives = volumes
 
     def closeEvent(self, event):
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("zoom", self.zoom_factor)
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, FileTab):
                 tab.cleanup()
         super().closeEvent(event)
+
+    # settings and zoom helpers
+    def set_default_path(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Default Directory", self.default_path)
+        if path:
+            self.default_path = path
+            self.settings.setValue("default_path", path)
+
+    def clear_default_path(self):
+        self.default_path = str(Path.home())
+        self.settings.remove("default_path")
+
+    def zoom_in(self):
+        self.zoom_factor *= 1.1
+        self.apply_zoom()
+
+    def zoom_out(self):
+        self.zoom_factor /= 1.1
+        self.apply_zoom()
+
+    def reset_zoom(self):
+        self.zoom_factor = 1.0
+        self.apply_zoom()
+
+    def apply_zoom(self):
+        font = QFont()
+        font.setPointSizeF(self.base_font_size * self.zoom_factor)
+        self.setFont(font)
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, FileTab):
+                tab.set_font(font)
+
+    def show_about(self):
+        QMessageBox.about(
+            self,
+            "About Spleen",
+            "Spleen is a lightweight file manager with tabbed browsing, search, "
+            "context menu actions, clipboard operations, drive detection, "
+            "configurable default path and a zoomable interface.",
+        )
 
 
 def main():

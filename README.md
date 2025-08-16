@@ -1,2 +1,28 @@
 # Spleen
-A simple but powerful file manager created for use in hyprland instances. Essentially custom built for the hyprrice system created in another repo.
+
+Spleen is a lightweight PyQt file manager built for Hyprland.
+
+## Features
+
+- Tabbed file browsing with live search filtering
+- Context menu actions: open, rename, delete, new folder, copy/move, properties and zip extraction
+- Cut/Copy/Paste between directories
+- Automatic detection of newly mounted drives
+- Configurable default start directory saved across sessions
+- Zoomable, resizable interface with persistent window size
+- Watches directories for changes and refreshes automatically
+
+## Installation
+
+```bash
+pip install PyQt5 watchdog
+```
+
+Run the application:
+
+```bash
+python spleen.py
+```
+
+Settings are stored automatically using Qt's `QSettings` and will be reused on next launch.
+
