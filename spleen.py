@@ -11,6 +11,10 @@ import zipfile
 import fnmatch
 from pathlib import Path
 import subprocess
+import stat
+import pwd
+import grp
+import time
 
 from PyQt5.QtCore import (
     Qt,
@@ -441,7 +445,28 @@ class FileTab(QWidget):
             self.view.setCurrentIndex(proxy_idx)
             self.view.edit(proxy_idx)
 
+    def move_to_trash(self, path: str) -> bool:
+        for cmd in (["gio", "trash", path], ["trash-put", path]):
+            try:
+                subprocess.check_call(cmd)
+                return True
+            except FileNotFoundError:
+                continue
+            except subprocess.CalledProcessError:
+                return False
+        return False
+
     def delete_items(self, paths):
+        settings = QSettings("Spleen", "Spleen")
+        use_trash = settings.value("use_trash", True, type=bool)
+        if use_trash:
+            success = True
+            for p in paths:
+                if not self.move_to_trash(p):
+                    success = False
+                    break
+            if success:
+                return
         reply = QMessageBox.question(
             self,
             "Delete",
@@ -473,8 +498,42 @@ class FileTab(QWidget):
 
     def show_properties(self, path):
         info = Path(path)
-        size = info.stat().st_size
-        msg = f"Path: {path}\nSize: {size} bytes"
+        try:
+            stat_info = info.lstat()
+        except OSError as e:
+            QMessageBox.warning(self, "Error", str(e))
+            return
+
+        size = stat_info.st_size
+        perms = stat.filemode(stat_info.st_mode)
+        accessed = time.ctime(stat_info.st_atime)
+        modified = time.ctime(stat_info.st_mtime)
+        created = time.ctime(stat_info.st_ctime)
+        try:
+            owner = pwd.getpwuid(stat_info.st_uid).pw_name
+        except Exception:
+            owner = str(stat_info.st_uid)
+        try:
+            group = grp.getgrgid(stat_info.st_gid).gr_name
+        except Exception:
+            group = str(stat_info.st_gid)
+
+        msg = (
+            f"Path: {path}\n"
+            f"Size: {size} bytes\n"
+            f"Permissions: {perms}\n"
+            f"Owner: {owner}\n"
+            f"Group: {group}\n"
+            f"Accessed: {accessed}\n"
+            f"Modified: {modified}\n"
+            f"Created: {created}"
+        )
+        if info.is_symlink():
+            try:
+                target = os.readlink(path)
+                msg += f"\nSymlink target: {target}"
+            except OSError:
+                pass
         QMessageBox.information(self, "Properties", msg)
 
     def extract_zip(self, path):
@@ -553,7 +612,11 @@ class MainWindow(QMainWindow):
         set_def_act.triggered.connect(self.set_default_path)
         clr_def_act = QAction("Clear Default Path", self)
         clr_def_act.triggered.connect(self.clear_default_path)
-        settings_menu.addActions([set_def_act, clr_def_act])
+        use_trash = self.settings.value("use_trash", True, type=bool)
+        trash_act = QAction("Use Trash when available", self, checkable=True)
+        trash_act.setChecked(use_trash)
+        trash_act.triggered.connect(lambda c: self.settings.setValue("use_trash", c))
+        settings_menu.addActions([set_def_act, clr_def_act, trash_act])
 
         help_menu = self.menuBar().addMenu("Help")
         about_act = QAction("About", self)
