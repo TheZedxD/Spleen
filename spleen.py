@@ -8,6 +8,7 @@ import os
 import sys
 import shutil
 import zipfile
+import fnmatch
 from pathlib import Path
 
 from PyQt5.QtCore import (
@@ -40,6 +41,9 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QHBoxLayout,
     QProgressDialog,
+    QToolButton,
+    QCheckBox,
+    QListWidget,
 )
 
 from watchdog.observers import Observer
@@ -119,6 +123,38 @@ class FileOpWorker(QRunnable):
         self.signals.finished.emit(errors)
 
 
+class SearchSignals(QObject):
+    """Signals for deep search worker."""
+
+    found = pyqtSignal(str)
+    finished = pyqtSignal()
+
+
+class DeepSearchWorker(QRunnable):
+    """Recursively search for files matching a pattern."""
+
+    def __init__(self, root: str, pattern: str):
+        super().__init__()
+        self.root = root
+        self.pattern = pattern
+        self.signals = SearchSignals()
+
+    def run(self):  # type: ignore[override]
+        def scan(path: str):
+            try:
+                with os.scandir(path) as it:
+                    for entry in it:
+                        if fnmatch.fnmatch(entry.name, self.pattern):
+                            self.signals.found.emit(entry.path)
+                        if entry.is_dir(follow_symlinks=False):
+                            scan(entry.path)
+            except OSError:
+                pass
+
+        scan(self.root)
+        self.signals.finished.emit()
+
+
 def run_file_operation(parent: QWidget, op: str, paths: list[str], dest: str | None = None, on_done=None):
     """Run a file operation with progress dialog and threading."""
 
@@ -159,12 +195,26 @@ class FileTab(QWidget):
         self.path = path
 
         layout = QVBoxLayout(self)
+
+        self.breadcrumb_layout = QHBoxLayout()
+        layout.addLayout(self.breadcrumb_layout)
+
         search_layout = QHBoxLayout()
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search...")
         search_layout.addWidget(self.search)
+
+        self.deep_search = QCheckBox("Deep Search")
+        search_layout.addWidget(self.deep_search)
+
         layout.addLayout(search_layout)
+
+        self.results = QListWidget()
+        self.results.setMaximumHeight(100)
+        self.results.hide()
+        self.results.itemDoubleClicked.connect(self.open_result)
+        layout.addWidget(self.results)
 
         self.model = QFileSystemModel()
         self.model.setRootPath(self.path)
@@ -193,9 +243,17 @@ class FileTab(QWidget):
         f2.triggered.connect(lambda: self.view.edit(self.view.currentIndex()))
         self.addAction(f2)
 
+        go_act = QAction(self)
+        go_act.setShortcut("Ctrl+L")
+        go_act.triggered.connect(self.prompt_path)
+        self.addAction(go_act)
+
         layout.addWidget(self.view)
 
-        self.search.textChanged.connect(self.proxy.setFilterWildcard)
+        self.search.textChanged.connect(self.on_search_text_changed)
+        self.deep_search.stateChanged.connect(lambda _s: self.on_search_text_changed(self.search.text()))
+
+        self.update_breadcrumb()
 
         # directory watcher with debounced refresh
         self.watcher = DirectoryWatcher(self.path)
@@ -221,6 +279,51 @@ class FileTab(QWidget):
     def set_font(self, font: QFont):
         self.view.setFont(font)
         self.search.setFont(font)
+
+    def cd(self, path: str):
+        self.path = path
+        self.model.setRootPath(self.path)
+        self.view.setRootIndex(self.proxy.mapFromSource(self.model.index(self.path)))
+        self.update_breadcrumb()
+        parent = self.parentWidget()
+        if isinstance(parent, QTabWidget):
+            parent.setTabText(parent.indexOf(self), self.path)
+
+    def update_breadcrumb(self):
+        while self.breadcrumb_layout.count():
+            item = self.breadcrumb_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        parts = Path(self.path).parts
+        for i, part in enumerate(parts):
+            btn = QToolButton()
+            btn.setText(part)
+            crumb_path = str(Path(*parts[: i + 1]))
+            btn.clicked.connect(lambda _c, p=crumb_path: self.cd(p))
+            self.breadcrumb_layout.addWidget(btn)
+
+    def prompt_path(self):
+        path, ok = QInputDialog.getText(self, "Go to Path", "Path:", text=self.path)
+        if ok and path and os.path.isdir(path):
+            self.cd(path)
+
+    def on_search_text_changed(self, text: str):
+        self.proxy.setFilterWildcard(text)
+        self.results.clear()
+        if self.deep_search.isChecked() and text:
+            self.results.show()
+            worker = DeepSearchWorker(self.path, f"*{text}*")
+            worker.signals.found.connect(lambda p: self.results.addItem(p))
+            QThreadPool.globalInstance().start(worker)
+        else:
+            self.results.hide()
+
+    def open_result(self, item):
+        path = item.text()
+        if os.path.isdir(path):
+            self.cd(path)
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     # Context menu implementation
     def open_menu(self, position):
