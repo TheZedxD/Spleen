@@ -4,8 +4,7 @@ Provides a lightweight tabbed interface with search, context menu file
 operations, drive monitoring, configurable defaults and a zoomable UI.
 """
 
-import os
-import sys
+import os, sys
 import fnmatch
 from pathlib import Path
 import subprocess
@@ -27,7 +26,7 @@ def is_network_path(p: str) -> bool:
         return False
     if IS_WINDOWS:
         return p.startswith("\\\\") or p.startswith("//")
-    p = os.path.abspath(p)
+    # Treat mounted GVFS as networky for auto-scan avoidance
     return p.startswith("/run/user/") and "/gvfs/" in p
 
 
@@ -521,7 +520,7 @@ class FileTab(QWidget):
                 target = p if os.path.isdir(p) else os.path.dirname(p)
             else:
                 target = self.path
-            self.open_terminal(target)
+            self.open_terminal_here(target)
         elif action == extract_act and paths:
             self.extract_zip(paths[0])
 
@@ -592,15 +591,21 @@ class FileTab(QWidget):
             return
         run_file_operation(self, op.lower(), paths, dest)
 
-    def open_terminal(self, path):
+    def open_terminal_here(self, path: str):
         if IS_WINDOWS:
-            cmds = [["wt.exe", "-d", path], ["powershell"], ["cmd"]]
+            cmds = [
+                ["wt.exe", "-d", path],
+                [
+                    "powershell.exe",
+                    "-NoExit",
+                    "-Command",
+                    f"Set-Location -LiteralPath '{path}'",
+                ],
+                ["cmd.exe", "/K", "cd", "/d", path],
+            ]
             for cmd in cmds:
                 try:
-                    if cmd[0].lower() == "wt.exe":
-                        subprocess.Popen(cmd)
-                    else:
-                        subprocess.Popen(cmd, cwd=path)
+                    subprocess.Popen(cmd)
                     return
                 except FileNotFoundError:
                     continue
