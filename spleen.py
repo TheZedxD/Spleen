@@ -6,8 +6,6 @@ operations, drive monitoring, configurable defaults and a zoomable UI.
 
 import os
 import sys
-import shutil
-import zipfile
 import fnmatch
 from pathlib import Path
 import subprocess
@@ -15,6 +13,8 @@ import stat
 import pwd
 import grp
 import time
+
+import spleen_ops
 
 from PyQt5.QtCore import (
     Qt,
@@ -48,6 +48,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QProgressDialog,
     QToolButton,
+    QToolBar,
     QCheckBox,
     QListWidget,
 )
@@ -108,21 +109,11 @@ class FileOpWorker(QRunnable):
                 break
             try:
                 if self.op == "copy":
-                    base = os.path.basename(path)
-                    target = os.path.join(self.dest, base)  # type: ignore[arg-type]
-                    if os.path.isdir(path):
-                        shutil.copytree(path, target)
-                    else:
-                        shutil.copy2(path, target)
+                    spleen_ops.copy_path(path, self.dest)  # type: ignore[arg-type]
                 elif self.op == "move":
-                    base = os.path.basename(path)
-                    target = os.path.join(self.dest, base)  # type: ignore[arg-type]
-                    shutil.move(path, target)
+                    spleen_ops.move_path(path, self.dest)  # type: ignore[arg-type]
                 elif self.op == "delete":
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
+                    spleen_ops.delete_path(path)
             except OSError as e:
                 errors.append(f"{path}: {e}")
             self.signals.progress.emit(i, total, path)
@@ -253,6 +244,8 @@ class FileTab(QWidget):
     def __init__(self, path: str):
         super().__init__()
         self.path = path
+        self.history: list[str] = [path]
+        self.history_index = 0
 
         layout = QVBoxLayout(self)
 
@@ -340,7 +333,11 @@ class FileTab(QWidget):
         self.view.setFont(font)
         self.search.setFont(font)
 
-    def cd(self, path: str):
+    def cd(self, path: str, add_history: bool = True):
+        if add_history:
+            self.history = self.history[: self.history_index + 1]
+            self.history.append(path)
+            self.history_index += 1
         self.path = path
         self.model.setRootPath(self.path)
         self.view.setRootIndex(self.proxy.mapFromSource(self.model.index(self.path)))
@@ -348,6 +345,16 @@ class FileTab(QWidget):
         parent = self.parentWidget()
         if isinstance(parent, QTabWidget):
             parent.setTabText(parent.indexOf(self), self.path)
+
+    def back(self):
+        if self.history_index > 0:
+            self.history_index -= 1
+            self.cd(self.history[self.history_index], add_history=False)
+
+    def forward(self):
+        if self.history_index < len(self.history) - 1:
+            self.history_index += 1
+            self.cd(self.history[self.history_index], add_history=False)
 
     def update_breadcrumb(self):
         while self.breadcrumb_layout.count():
@@ -538,9 +545,8 @@ class FileTab(QWidget):
 
     def extract_zip(self, path):
         try:
-            with zipfile.ZipFile(path, 'r') as zf:
-                zf.extractall(os.path.dirname(path))
-        except (zipfile.BadZipFile, OSError) as e:
+            spleen_ops.extract_zip(path, os.path.dirname(path))
+        except OSError as e:
             QMessageBox.warning(self, "Error", str(e))
 
 
@@ -553,7 +559,9 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("Spleen", "Spleen")
         self.default_path = self.settings.value("default_path", str(Path.home()))
         self.zoom_factor = float(self.settings.value("zoom", 1.0))
-        self.base_font_size = self.font().pointSizeF()
+        self.base_font_size = float(
+            self.settings.value("font_size", self.font().pointSizeF())
+        )
 
         geometry = self.settings.value("geometry")
         if geometry:
@@ -568,7 +576,14 @@ class MainWindow(QMainWindow):
         self.cut_mode = False
 
         self.create_menus()
-        self.new_tab(self.default_path)
+        self.create_toolbar()
+        tab_paths = self.settings.value("tabs", [], type=list)
+        if tab_paths:
+            for p in tab_paths:
+                if isinstance(p, str) and os.path.isdir(p):
+                    self.new_tab(p)
+        else:
+            self.new_tab(self.default_path)
         self.apply_zoom()
 
         self.drives = set()
@@ -605,7 +620,9 @@ class MainWindow(QMainWindow):
         reset_zoom_act = QAction("Reset Zoom", self)
         reset_zoom_act.setShortcut("Ctrl+0")
         reset_zoom_act.triggered.connect(self.reset_zoom)
-        view_menu.addActions([zoom_in_act, zoom_out_act, reset_zoom_act])
+        font_size_act = QAction("Font Size...", self)
+        font_size_act.triggered.connect(self.set_font_size)
+        view_menu.addActions([zoom_in_act, zoom_out_act, reset_zoom_act, font_size_act])
 
         settings_menu = self.menuBar().addMenu("Settings")
         set_def_act = QAction("Set Default Path", self)
@@ -622,6 +639,20 @@ class MainWindow(QMainWindow):
         about_act = QAction("About", self)
         about_act.triggered.connect(self.show_about)
         help_menu.addAction(about_act)
+
+    def create_toolbar(self):
+        nav = QToolBar("Navigation", self)
+        self.addToolBar(nav)
+        self.back_act = QAction("Back", self)
+        self.back_act.setShortcut("Alt+Left")
+        self.back_act.triggered.connect(lambda: self.current_tab().back())
+        nav.addAction(self.back_act)
+        self.addAction(self.back_act)
+        self.forward_act = QAction("Forward", self)
+        self.forward_act.setShortcut("Alt+Right")
+        self.forward_act.triggered.connect(lambda: self.current_tab().forward())
+        nav.addAction(self.forward_act)
+        self.addAction(self.forward_act)
 
     # menu actions
     def new_tab(self, path=None):
@@ -684,10 +715,14 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("zoom", self.zoom_factor)
+        paths = []
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, FileTab):
+                paths.append(tab.path)
                 tab.cleanup()
+        self.settings.setValue("tabs", paths)
+        self.settings.setValue("font_size", self.base_font_size)
         super().closeEvent(event)
 
     # settings and zoom helpers
@@ -700,6 +735,15 @@ class MainWindow(QMainWindow):
     def clear_default_path(self):
         self.default_path = str(Path.home())
         self.settings.remove("default_path")
+
+    def set_font_size(self):
+        size, ok = QInputDialog.getInt(
+            self, "Font Size", "Point size:", int(self.base_font_size), 4, 72
+        )
+        if ok:
+            self.base_font_size = float(size)
+            self.settings.setValue("font_size", self.base_font_size)
+            self.apply_zoom()
 
     def zoom_in(self):
         self.zoom_factor *= 1.1
@@ -733,12 +777,13 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(
         """
         QWidget { background-color: black; color: #00ff00; }
-        QTreeView { selection-background-color: #003300; }
+        QTreeView { selection-background-color: #003300; selection-color: #00ff00; }
         QMenu { background-color: black; color: #00ff00; }
         QLineEdit { background-color: black; color: #00ff00; }
         """
