@@ -104,16 +104,23 @@ class FileTab(QWidget):
 
         self.search.textChanged.connect(self.proxy.setFilterWildcard)
 
-        # directory watcher
+        # directory watcher with debounced refresh
         self.watcher = DirectoryWatcher(self.path)
-        self.watcher.changed.connect(self.refresh)
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.setInterval(300)
+        self.refresh_timer.timeout.connect(self.refresh)
+        self.watcher.changed.connect(lambda: self.refresh_timer.start())
         self.watcher.start()
 
         # apply current font
         self.set_font(self.font())
 
     def refresh(self):
-        self.model.refresh(self.model.index(self.path))
+        root = self.model.rootPath()
+        self.model.setRootPath("")
+        self.model.setRootPath(root)
+        self.view.setRootIndex(self.proxy.mapFromSource(self.model.index(root)))
 
     def cleanup(self):
         self.watcher.stop()
