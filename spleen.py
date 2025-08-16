@@ -13,8 +13,27 @@ import stat
 import pwd
 import grp
 import time
+import string
 
 import spleen_ops
+
+# OS detection globals
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def is_network_path(p: str) -> bool:
+    if not p:
+        return False
+    if IS_WINDOWS:
+        return p.startswith("\\\\") or p.startswith("//")
+    p = os.path.abspath(p)
+    return p.startswith("/run/user/") and "/gvfs/" in p
+
+
+def is_supported_start_path(p: str) -> bool:
+    return bool(p) and not is_network_path(p)
+
 
 from PyQt5.QtCore import (
     Qt,
@@ -28,6 +47,7 @@ from PyQt5.QtCore import (
     QRunnable,
     QThreadPool,
     QItemSelectionModel,
+    QDir,
 )
 from PyQt5.QtGui import QDesktopServices, QFont
 from PyQt5.QtWidgets import (
@@ -55,6 +75,42 @@ from PyQt5.QtWidgets import (
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
+
+def windows_local_drives():
+    import ctypes
+
+    GetLogicalDrives = ctypes.windll.kernel32.GetLogicalDrives
+    GetDriveTypeW = ctypes.windll.kernel32.GetDriveTypeW
+    DRIVE_UNKNOWN, DRIVE_NO_ROOT_DIR, DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_REMOTE, DRIVE_CDROM, DRIVE_RAMDISK = (
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    )
+    mask = GetLogicalDrives()
+    out = []
+    for i, letter in enumerate(string.ascii_uppercase):
+        if mask & (1 << i):
+            root = f"{letter}:\\"
+            dtype = GetDriveTypeW(root)
+            if dtype in (DRIVE_FIXED, DRIVE_REMOVABLE, DRIVE_CDROM):
+                out.append(root)
+    return out
+
+
+def linux_local_mounts():
+    local = []
+    for info in QStorageInfo.mountedVolumes():
+        if info.isValid() and info.isReady():
+            fs = bytes(info.fileSystemType()).decode(errors="ignore").lower()
+            if fs in {"cifs", "nfs", "sshfs", "fuse.sshfs", "fuse.gvfsd-fuse"}:
+                continue
+            local.append(info.rootPath())
+    return local
 
 
 class DirectoryWatcher(QObject, FileSystemEventHandler):
@@ -308,14 +364,17 @@ class FileTab(QWidget):
 
         self.update_breadcrumb()
 
-        # directory watcher with debounced refresh
-        self.watcher = DirectoryWatcher(self.path)
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.setSingleShot(True)
-        self.refresh_timer.setInterval(300)
-        self.refresh_timer.timeout.connect(self.refresh)
-        self.watcher.changed.connect(lambda: self.refresh_timer.start())
-        self.watcher.start()
+        # directory watcher with debounced refresh (local paths only)
+        if is_network_path(self.path):
+            self.watcher = None
+        else:
+            self.watcher = DirectoryWatcher(self.path)
+            self._refresh_timer = QTimer(self)
+            self._refresh_timer.setSingleShot(True)
+            self._refresh_timer.setInterval(300)
+            self._refresh_timer.timeout.connect(self.refresh)
+            self.watcher.changed.connect(lambda: self._refresh_timer.start())
+            self.watcher.start()
 
         # apply current font
         self.set_font(self.font())
@@ -327,7 +386,8 @@ class FileTab(QWidget):
         self.view.setRootIndex(self.proxy.mapFromSource(self.model.index(root)))
 
     def cleanup(self):
-        self.watcher.stop()
+        if self.watcher:
+            self.watcher.stop()
 
     def set_font(self, font: QFont):
         self.view.setFont(font)
@@ -344,7 +404,21 @@ class FileTab(QWidget):
         self.update_breadcrumb()
         parent = self.parentWidget()
         if isinstance(parent, QTabWidget):
-            parent.setTabText(parent.indexOf(self), self.path)
+            tab_title = QDir.toNativeSeparators(os.path.abspath(self.path))
+            parent.setTabText(parent.indexOf(self), tab_title)
+
+        if self.watcher:
+            self.watcher.stop()
+        if is_network_path(self.path):
+            self.watcher = None
+        else:
+            self.watcher = DirectoryWatcher(self.path)
+            self._refresh_timer = QTimer(self)
+            self._refresh_timer.setSingleShot(True)
+            self._refresh_timer.setInterval(300)
+            self._refresh_timer.timeout.connect(self.refresh)
+            self.watcher.changed.connect(lambda: self._refresh_timer.start())
+            self.watcher.start()
 
     def back(self):
         if self.history_index > 0:
@@ -371,8 +445,15 @@ class FileTab(QWidget):
 
     def prompt_path(self):
         path, ok = QInputDialog.getText(self, "Go to Path", "Path:", text=self.path)
-        if ok and path and os.path.isdir(path):
-            self.cd(path)
+        if ok and path:
+            if is_network_path(path):
+                QMessageBox.information(
+                    self,
+                    "Network Disabled",
+                    "Network locations are not scanned automatically. Use Network → Connect Network Share…",
+                )
+            elif os.path.isdir(path):
+                self.cd(path)
 
     def on_search_text_changed(self, text: str):
         self.proxy.setFilterWildcard(text)
@@ -410,6 +491,7 @@ class FileTab(QWidget):
         new_folder_act = menu.addAction("New Folder")
         copy_move_act = menu.addAction("Copy/Move")
         prop_act = menu.addAction("Properties")
+        term_act = menu.addAction("Open Terminal Here")
 
         if any(path.endswith('.zip') for path in paths):
             extract_act = menu.addAction("Extract Here")
@@ -433,6 +515,13 @@ class FileTab(QWidget):
             self.copy_move(paths)
         elif action == prop_act and paths:
             self.show_properties(paths[0])
+        elif action == term_act:
+            if paths:
+                p = paths[0]
+                target = p if os.path.isdir(p) else os.path.dirname(p)
+            else:
+                target = self.path
+            self.open_terminal(target)
         elif action == extract_act and paths:
             self.extract_zip(paths[0])
 
@@ -503,6 +592,41 @@ class FileTab(QWidget):
             return
         run_file_operation(self, op.lower(), paths, dest)
 
+    def open_terminal(self, path):
+        if IS_WINDOWS:
+            cmds = [["wt.exe", "-d", path], ["powershell"], ["cmd"]]
+            for cmd in cmds:
+                try:
+                    if cmd[0].lower() == "wt.exe":
+                        subprocess.Popen(cmd)
+                    else:
+                        subprocess.Popen(cmd, cwd=path)
+                    return
+                except FileNotFoundError:
+                    continue
+            QMessageBox.warning(self, "Error", "No terminal found")
+        else:
+            candidates = []
+            term = os.environ.get("TERMINAL")
+            if term:
+                candidates.append(term)
+            candidates += [
+                "alacritty",
+                "kitty",
+                "foot",
+                "wezterm",
+                "konsole",
+                "gnome-terminal",
+                "xterm",
+            ]
+            for term in candidates:
+                try:
+                    subprocess.Popen([term], cwd=path)
+                    return
+                except FileNotFoundError:
+                    continue
+            QMessageBox.warning(self, "Error", "No terminal found")
+
     def show_properties(self, path):
         info = Path(path)
         try:
@@ -557,7 +681,6 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(600, 400)
 
         self.settings = QSettings("Spleen", "Spleen")
-        self.default_path = self.settings.value("default_path", str(Path.home()))
         self.zoom_factor = float(self.settings.value("zoom", 1.0))
         self.base_font_size = float(
             self.settings.value("font_size", self.font().pointSizeF())
@@ -577,13 +700,16 @@ class MainWindow(QMainWindow):
 
         self.create_menus()
         self.create_toolbar()
-        tab_paths = self.settings.value("tabs", [], type=list)
-        if tab_paths:
-            for p in tab_paths:
-                if isinstance(p, str) and os.path.isdir(p):
-                    self.new_tab(p)
+
+        if IS_WINDOWS:
+            sysdrive = os.environ.get("SystemDrive", "C:")
+            start_path = sysdrive + "\\"
+            if not os.path.exists(start_path):
+                start_path = "C:\\"
         else:
-            self.new_tab(self.default_path)
+            start_path = str(Path.home())
+
+        self.new_tab(start_path)
         self.apply_zoom()
 
         self.drives = set()
@@ -625,15 +751,40 @@ class MainWindow(QMainWindow):
         view_menu.addActions([zoom_in_act, zoom_out_act, reset_zoom_act, font_size_act])
 
         settings_menu = self.menuBar().addMenu("Settings")
-        set_def_act = QAction("Set Default Path", self)
-        set_def_act.triggered.connect(self.set_default_path)
-        clr_def_act = QAction("Clear Default Path", self)
-        clr_def_act.triggered.connect(self.clear_default_path)
         use_trash = self.settings.value("use_trash", True, type=bool)
         trash_act = QAction("Use Trash when available", self, checkable=True)
         trash_act.setChecked(use_trash)
         trash_act.triggered.connect(lambda c: self.settings.setValue("use_trash", c))
-        settings_menu.addActions([set_def_act, clr_def_act, trash_act])
+        settings_menu.addAction(trash_act)
+
+        net_menu = self.menuBar().addMenu("Network")
+        connect_act = QAction("Connect Network Share…", self)
+        net_menu.addAction(connect_act)
+
+        def connect_share():
+            label = (
+                "UNC path (e.g. \\server\\share):"
+                if IS_WINDOWS
+                else "Mounted network path (e.g. /run/user/1000/gvfs/…):"
+            )
+            val, ok = QInputDialog.getText(self, "Connect to Network Share", label)
+            if not ok or not val:
+                return
+            if IS_WINDOWS and not is_network_path(val):
+                QMessageBox.warning(
+                    self, "Invalid", "Enter a UNC path like \\server\\share"
+                )
+                return
+            if IS_LINUX and not os.path.exists(val):
+                QMessageBox.information(
+                    self,
+                    "Not Mounted",
+                    "That path is not accessible. Mount it first (Files/Thunar or `gio mount`), then try again.",
+                )
+                return
+            self.new_tab(val, force=True)
+
+        connect_act.triggered.connect(connect_share)
 
         help_menu = self.menuBar().addMenu("Help")
         about_act = QAction("About", self)
@@ -655,14 +806,23 @@ class MainWindow(QMainWindow):
         self.addAction(self.forward_act)
 
     # menu actions
-    def new_tab(self, path=None):
+    def new_tab(self, path=None, force: bool = False):
         if path is None:
-            path = QFileDialog.getExistingDirectory(self, "Open Directory", self.default_path)
+            path = QFileDialog.getExistingDirectory(self, "Open Directory", str(Path.home()))
             if not path:
                 return
+        if not force and not is_supported_start_path(path):
+            QMessageBox.information(
+                self,
+                "Network Disabled",
+                "Network locations are not scanned automatically. Use Network → Connect Network Share…",
+            )
+            return
         tab = FileTab(path)
         tab.set_font(self.font())
-        index = self.tabs.addTab(tab, path)
+        index = self.tabs.addTab(tab, "")
+        tab_title = QDir.toNativeSeparators(os.path.abspath(path))
+        self.tabs.setTabText(index, tab_title)
         self.tabs.setCurrentIndex(index)
 
     def current_tab(self) -> FileTab:
@@ -702,39 +862,27 @@ class MainWindow(QMainWindow):
         run_file_operation(self, op, paths, dest, done)
 
     def check_drives(self):
-        volumes = {
-            info.rootPath()
-            for info in QStorageInfo.mountedVolumes()
-            if info.isValid() and info.isReady()
-        }
+        if IS_WINDOWS:
+            volumes = set(windows_local_drives())
+        else:
+            volumes = set(linux_local_mounts())
         new_drives = volumes - self.drives
-        for drive in new_drives:
-            self.new_tab(drive)
+        for drive in sorted(new_drives):
+            if is_supported_start_path(drive):
+                self.new_tab(drive)
         self.drives = volumes
 
     def closeEvent(self, event):
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("zoom", self.zoom_factor)
-        paths = []
+        self.settings.setValue("font_size", self.base_font_size)
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, FileTab):
-                paths.append(tab.path)
                 tab.cleanup()
-        self.settings.setValue("tabs", paths)
-        self.settings.setValue("font_size", self.base_font_size)
         super().closeEvent(event)
 
     # settings and zoom helpers
-    def set_default_path(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Default Directory", self.default_path)
-        if path:
-            self.default_path = path
-            self.settings.setValue("default_path", path)
-
-    def clear_default_path(self):
-        self.default_path = str(Path.home())
-        self.settings.remove("default_path")
 
     def set_font_size(self):
         size, ok = QInputDialog.getInt(
@@ -778,6 +926,7 @@ class MainWindow(QMainWindow):
 
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(
